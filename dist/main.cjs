@@ -1228,18 +1228,9 @@ import_electron.ipcMain.handle("data:insert", (_e, table, values) => dataWrite((
 import_electron.ipcMain.handle("data:delete", (_e, table, key) => dataWrite(() => deleteRow(db, table, key, nowIso())));
 var exportState = null;
 import_electron.ipcMain.handle("export:state", () => exportState);
-import_electron.ipcMain.handle("export:view", async (_e, req) => {
-  const ext = req.format;
-  const safe = req.viewName.replace(/[^A-Za-z0-9 _-]+/g, "").trim() || "view";
-  const auto = process.env.UNTANGLE_EXPORT_DIR;
-  const r = auto ? { canceled: false, filePath: (0, import_node_path2.join)(auto, `export.${ext}`) } : await import_electron.dialog.showSaveDialog(win, {
-    title: `Export ${ext.toUpperCase()}`,
-    defaultPath: (0, import_node_path2.join)(dbPath ? (0, import_node_path2.dirname)(dbPath) : import_electron.app.getPath("documents"), `${safe} ${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}.${ext}`),
-    filters: [{ name: ext.toUpperCase(), extensions: [ext] }]
-  });
-  if (r.canceled || !r.filePath) return { ok: false, message: "cancelled" };
-  exportState = { ...req, dataDate: lastDataDate() };
-  const W = 1920, H = 1080;
+async function withExportWindow(state, use) {
+  exportState = state;
+  const W = 1920;
   const wa = import_electron.screen.getPrimaryDisplay().workAreaSize;
   const fitW = Math.floor(Math.min(W, wa.width, wa.height * 16 / 9));
   const fitH = Math.round(fitW * 9 / 16);
@@ -1259,7 +1250,7 @@ import_electron.ipcMain.handle("export:view", async (_e, req) => {
   });
   try {
     const ready = new Promise((res, rej) => {
-      const t = setTimeout(() => rej(new Error("Export timed out.")), 2e4);
+      const t = setTimeout(() => rej(new Error("Export timed out.")), 2e4 + 5e3 * state.pages.length);
       import_electron.ipcMain.once("export:ready", () => {
         clearTimeout(t);
         res();
@@ -1271,28 +1262,74 @@ import_electron.ipcMain.handle("export:view", async (_e, req) => {
     await ew.loadFile(RENDERER, { hash: "export" });
     await ready;
     await new Promise((res) => setTimeout(res, 300));
-    if (ext === "png") {
-      const full = await ew.webContents.capturePage();
-      const k = full.getSize().width / ew.getContentSize()[0];
-      const img = full.crop({ x: 0, y: 0, width: Math.round(fitW * k), height: Math.round(fitH * k) });
-      (0, import_node_fs2.writeFileSync)(r.filePath, img.toPNG());
-    } else {
-      const pdf = await ew.webContents.printToPDF({
-        pageSize: { width: 13.333, height: 7.5 },
-        // 16:9 slide, inches
-        printBackground: true,
-        margins: { top: 0, bottom: 0, left: 0, right: 0 },
-        scale: 1280 / W
-        // CSS px are unaffected by the window zoom when printing
-      });
-      (0, import_node_fs2.writeFileSync)(r.filePath, pdf);
-    }
-    return { ok: true, path: r.filePath };
-  } catch (e) {
-    return { ok: false, message: e.message };
+    return await use(ew, fitW, fitH);
   } finally {
     exportState = null;
     ew.destroy();
+  }
+}
+async function capturePng(ew, fitW, fitH) {
+  const full = await ew.webContents.capturePage();
+  const k = full.getSize().width / ew.getContentSize()[0];
+  return full.crop({ x: 0, y: 0, width: Math.round(fitW * k), height: Math.round(fitH * k) }).toPNG();
+}
+function printPdf(ew) {
+  return ew.webContents.printToPDF({
+    pageSize: { width: 13.333, height: 7.5 },
+    // 16:9 slide, inches
+    printBackground: true,
+    margins: { top: 0, bottom: 0, left: 0, right: 0 },
+    scale: 1280 / 1920
+    // CSS px are unaffected by the window zoom when printing
+  });
+}
+var safeName = (s) => s.replace(/[^A-Za-z0-9 _-]+/g, "").trim() || "view";
+async function askExportPath(ext, name) {
+  const auto = process.env.UNTANGLE_EXPORT_DIR;
+  if (auto) return (0, import_node_path2.join)(auto, `${name === "export" ? "export" : safeName(name)}.${ext}`);
+  const r = await import_electron.dialog.showSaveDialog(win, {
+    title: `Export ${ext.toUpperCase()}`,
+    defaultPath: (0, import_node_path2.join)(dbPath ? (0, import_node_path2.dirname)(dbPath) : import_electron.app.getPath("documents"), `${safeName(name)} ${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}.${ext}`),
+    filters: [{ name: ext.toUpperCase(), extensions: [ext] }]
+  });
+  return r.canceled || !r.filePath ? null : r.filePath;
+}
+import_electron.ipcMain.handle("export:view", async (_e, req) => {
+  const path = await askExportPath(req.format, process.env.UNTANGLE_EXPORT_DIR ? "export" : req.viewName);
+  if (!path) return { ok: false, message: "cancelled" };
+  const state = {
+    pages: [{ title: req.viewName, definition: req.definition, expanded: req.expanded }],
+    range: req.range,
+    showOverlaps: req.showOverlaps,
+    dataDate: lastDataDate()
+  };
+  try {
+    await withExportWindow(state, async (ew, w, h) => (0, import_node_fs2.writeFileSync)(path, req.format === "png" ? await capturePng(ew, w, h) : await printPdf(ew)));
+    return { ok: true, path };
+  } catch (e) {
+    return { ok: false, message: e.message };
+  }
+});
+import_electron.ipcMain.handle("export:pack", async (_e, req) => {
+  if (!req.pages.length) return { ok: false, message: "Nothing to export: tick at least one page." };
+  const path = await askExportPath(req.format, req.name);
+  if (!path) return { ok: false, message: "cancelled" };
+  const base = { range: req.range, showOverlaps: req.showOverlaps, dataDate: lastDataDate() };
+  try {
+    if (req.format === "pdf") {
+      await withExportWindow({ ...base, pages: req.pages }, async (ew) => (0, import_node_fs2.writeFileSync)(path, await printPdf(ew)));
+      return { ok: true, paths: [path] };
+    }
+    const paths = [];
+    const stem = path.replace(/\.png$/i, "");
+    for (const page of req.pages) {
+      const out = req.pages.length === 1 ? path : `${stem} - ${safeName(page.title)}.png`;
+      await withExportWindow({ ...base, pages: [page] }, async (ew, w, h) => (0, import_node_fs2.writeFileSync)(out, await capturePng(ew, w, h)));
+      paths.push(out);
+    }
+    return { ok: true, paths };
+  } catch (e) {
+    return { ok: false, message: e.message };
   }
 });
 function lastDataDate() {

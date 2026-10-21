@@ -19,6 +19,7 @@ var api = {
   dataInsert: (table, values) => import_electron.ipcRenderer.invoke("data:insert", table, values),
   dataDelete: (table, key) => import_electron.ipcRenderer.invoke("data:delete", table, key),
   exportView: (req) => import_electron.ipcRenderer.invoke("export:view", req),
+  exportPack: (req) => import_electron.ipcRenderer.invoke("export:pack", req),
   onDataChanged: (cb) => {
     const h = (_e, ds, why) => cb(ds, why);
     import_electron.ipcRenderer.on("db:changed", h);
