@@ -1,0 +1,11 @@
+node_modules/
+config.json
+*.sqlite
+!db/sample.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*-wal
+*-shm
+*.db
+backups/
+*.log

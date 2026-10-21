@@ -1,0 +1,10 @@
+{
+  "name": "untangle-app",
+  "version": "0.1.0",
+  "description": "Untangle: offline lab master schedule (Electron + SQLite). Run-only build.",
+  "main": "dist/main.cjs",
+  "private": true,
+  "scripts": {
+    "start": "electron ."
+  }
+}
