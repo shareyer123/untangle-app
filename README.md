@@ -8,10 +8,10 @@ Offline master schedule for a lab. Electron + SQLite. This repo holds only the b
 ```
 git clone https://github.com/shareyer123/untangle-app.git %USERPROFILE%\untangle
 cd %USERPROFILE%\untangle
-npm install --no-save electron@44.9.3
+electron .
 ```
 
-Then double-click `Start Untangle.bat`. It runs `git pull` and starts the app.
+Run it from this folder with `electron .`. To update: `git pull`, then start it again.
 
 ## Your data
 
