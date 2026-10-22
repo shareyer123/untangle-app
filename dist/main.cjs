@@ -31,8 +31,9 @@ function quoteIdent(name) {
 }
 
 // src/core/schema.ts
-var SCHEMA_VERSION = 1;
-var OUR_TABLES = ["facilities", "projects", "schedule_items", "change_log", "views", "meta"];
+var SCHEMA_VERSION = 2;
+var V1_TABLES = ["facilities", "projects", "schedule_items", "change_log", "views", "meta"];
+var OUR_TABLES = [...V1_TABLES, "project_events"];
 var SCHEMA_SQL = `CREATE TABLE IF NOT EXISTS facilities (
   code   TEXT PRIMARY KEY,
   name   TEXT,
@@ -90,12 +91,33 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE INDEX IF NOT EXISTS idx_items_project  ON schedule_items (project_id);
 CREATE INDEX IF NOT EXISTS idx_items_facility ON schedule_items (facility, start_date, end_date);
 `;
-var SCHEMA_FILE = `-- Untangle schema v1 (SPEC \xA74.2). Generated from src/core/schema.ts \u2014 do not edit by hand.
+var PROJECT_EVENTS_SQL = `CREATE TABLE IF NOT EXISTS project_events (
+  id          INTEGER PRIMARY KEY,
+  project_id  INTEGER NOT NULL REFERENCES projects(id),
+  track       TEXT NOT NULL CHECK (track IN ('sys','sw')),
+  kind        TEXT NOT NULL CHECK (kind IN ('range','milestone')),
+  label       TEXT NOT NULL,
+  facility    TEXT REFERENCES facilities(code),
+  start_date  TEXT,
+  end_date    TEXT,
+  confidence  TEXT NOT NULL DEFAULT 'notional'
+              CHECK (confidence IN ('firm','estimated','notional')),
+  note        TEXT,
+  updated_at  TEXT NOT NULL,
+  updated_by  TEXT NOT NULL CHECK (updated_by IN ('luna','app')),
+  CHECK (kind = 'milestone' OR end_date IS NULL OR start_date IS NULL OR end_date >= start_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_events_project ON project_events (project_id);
+CREATE INDEX IF NOT EXISTS idx_project_events_dates   ON project_events (start_date, end_date);
+`;
+var SCHEMA_FILE = `-- Untangle schema v2 (SPEC \xA74.2 + Software Book 11.6). Generated from src/core/schema.ts \u2014 do not edit by hand.
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 PRAGMA user_version = ${SCHEMA_VERSION};
 
-${SCHEMA_SQL}`;
+${SCHEMA_SQL}
+${PROJECT_EVENTS_SQL}`;
 var STARTER_VIEWS = [
   { name: "Near term", definition: { range: { kind: "relative", monthsBefore: 0, monthsAfter: 18 }, lanes: "facility", filters: {} } },
   { name: "Long term", definition: { range: { kind: "fixed", start: "2026-01-01", end: "2035-12-31" }, lanes: "bucket", filters: {} } },
@@ -401,7 +423,7 @@ function detect(db2) {
   const tables2 = listTables(db2);
   const version = db2.get("PRAGMA user_version")?.user_version ?? 0;
   const ours = OUR_TABLES.filter((t) => tables2.includes(t));
-  if (ours.length === OUR_TABLES.length && version === SCHEMA_VERSION) return { kind: "untangle" };
+  if (V1_TABLES.every((t) => tables2.includes(t)) && version >= 1 && version <= SCHEMA_VERSION) return { kind: "untangle" };
   if (tables2.length === 0) return { kind: "empty" };
   if (ours.length > 0) {
     return {
@@ -421,8 +443,19 @@ function detect(db2) {
   if (best) return { kind: "legacy", table: best.table, map: best.map };
   return { kind: "unknown", tables: tables2.map((name) => ({ name, columns: tableColumns(db2, name) })) };
 }
+function needsMigration(db2) {
+  const version = db2.get("PRAGMA user_version")?.user_version ?? 0;
+  return version < SCHEMA_VERSION || !listTables(db2).includes("project_events");
+}
+function migrate(db2) {
+  tx(db2, () => {
+    db2.exec(PROJECT_EVENTS_SQL);
+    db2.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+  });
+}
 function createSchema(db2, now, extraFacilities = []) {
   db2.exec(SCHEMA_SQL);
+  db2.exec(PROJECT_EVENTS_SQL);
   const fac = db2.get("SELECT count(*) n FROM facilities").n;
   if (fac === 0) for (const code of DEFAULT_FACILITIES) db2.run("INSERT INTO facilities (code, name) VALUES (?, ?)", code, code);
   for (const code of extraFacilities) db2.run("INSERT OR IGNORE INTO facilities (code, name) VALUES (?, ?)", code, code);
@@ -567,6 +600,8 @@ function loadDataset(db2) {
     facilities: db2.all("SELECT code, name, active FROM facilities ORDER BY code"),
     projects: db2.all("SELECT * FROM projects WHERE active = 1 ORDER BY sort_order IS NULL, sort_order, name"),
     items: db2.all("SELECT * FROM schedule_items ORDER BY project_id, start_date IS NULL, start_date, id"),
+    // A v1 file (read by Luna's tools before the app migrates it) has no project_events yet.
+    events: listTables(db2).includes("project_events") ? db2.all("SELECT * FROM project_events ORDER BY project_id, start_date IS NULL, start_date, id") : [],
     views: db2.all("SELECT id, name, definition FROM views ORDER BY id").map((v) => ({ id: v.id, name: v.name, definition: JSON.parse(v.definition) })),
     meta
   };
@@ -657,6 +692,7 @@ function undoLast(db2, now) {
     "SELECT id, item_id, field, old_value, new_value FROM change_log WHERE changed_by = 'app' AND changed_at = ? AND field NOT LIKE 'undo%' ORDER BY id",
     last.changed_at
   );
+  if (rows.some((r) => r.field.startsWith("event:"))) return undoEvent(db2, rows.filter((r) => r.field.startsWith("event:")), last.changed_at, now);
   const del = rows.find((r) => r.field === "deleted");
   if (del) {
     try {
@@ -696,7 +732,7 @@ function undoLast(db2, now) {
   for (const id of ids) {
     const cur = db2.get("SELECT updated_at FROM schedule_items WHERE id = ?", id);
     const mine = db2.get(
-      "SELECT changed_at FROM change_log WHERE item_id = ? AND changed_by = 'app' ORDER BY id DESC LIMIT 1",
+      "SELECT changed_at FROM change_log WHERE item_id = ? AND changed_by = 'app' AND instr(field, 'event:') = 0 ORDER BY id DESC LIMIT 1",
       id
     );
     if (!cur || !mine || cur.updated_at !== mine.changed_at) {
@@ -807,6 +843,189 @@ function setLabelStyles(db2, scope, patch, mode = "replace") {
     return cur;
   });
 }
+var EVENT_FIELDS = ["track", "kind", "label", "facility", "start_date", "end_date", "confidence", "note"];
+var logEvent = (db2, id, field, oldV, newV, at, by) => db2.run(
+  "INSERT INTO change_log (item_id, field, old_value, new_value, changed_at, changed_by) VALUES (?, ?, ?, ?, ?, ?)",
+  id,
+  `event:${field}`,
+  oldV,
+  newV,
+  at,
+  by
+);
+function validateEvent(e) {
+  const iso = /^\d{4}-\d{2}-\d{2}$/;
+  if (!e.label?.trim()) return "An event needs a label.";
+  if (e.start_date && !iso.test(e.start_date)) return `Bad start date: ${e.start_date}`;
+  if (e.end_date && !iso.test(e.end_date)) return `Bad end date: ${e.end_date}`;
+  if (e.kind === "range" && e.start_date && e.end_date && e.end_date < e.start_date) return "End date is before start date.";
+  return null;
+}
+function addEvent(db2, input, now, by = "app") {
+  const row = { facility: null, start_date: null, end_date: null, confidence: "notional", note: null, ...input };
+  if (row.kind === "milestone") row.end_date = null;
+  const err = validateEvent(row);
+  if (err) throw new Error(err);
+  return tx(db2, () => {
+    const r = db2.run(
+      `INSERT INTO project_events (project_id, track, kind, label, facility, start_date, end_date, confidence, note, updated_at, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      row.project_id,
+      row.track,
+      row.kind,
+      row.label.trim(),
+      row.facility,
+      row.start_date,
+      row.end_date,
+      row.confidence,
+      row.note,
+      now,
+      by
+    );
+    logEvent(db2, r.lastInsertRowid, "created", null, row.label.trim(), now, by);
+    return db2.get("SELECT * FROM project_events WHERE id = ?", r.lastInsertRowid);
+  });
+}
+var StaleEventError = class extends Error {
+  constructor(rows) {
+    super("stale");
+    this.rows = rows;
+  }
+  rows;
+};
+function applyEventChanges(db2, changes, now, by = "app") {
+  try {
+    const updated = tx(db2, () => {
+      const stale = [];
+      const out = [];
+      for (const c of changes) {
+        const cur = db2.get("SELECT * FROM project_events WHERE id = ?", c.id);
+        if (!cur) throw new Error(`Event ${c.id} no longer exists.`);
+        if (cur.updated_at !== c.expectedUpdatedAt) {
+          stale.push(cur);
+          continue;
+        }
+        const next = { ...cur };
+        for (const f of Object.keys(c.patch).filter((f2) => EVENT_FIELDS.includes(f2))) {
+          next[f] = c.patch[f] ?? null;
+        }
+        if (next.kind === "milestone") next.end_date = null;
+        const err = validateEvent(next);
+        if (err) throw new Error(err);
+        const changed = EVENT_FIELDS.filter((f) => next[f] !== cur[f]);
+        if (changed.length === 0) {
+          out.push(cur);
+          continue;
+        }
+        const stamp2 = now > cur.updated_at ? now : bump(cur.updated_at);
+        db2.run(
+          `UPDATE project_events SET ${changed.map((f) => `${f} = ?`).join(", ")}, updated_at = ?, updated_by = ? WHERE id = ?`,
+          ...changed.map((f) => next[f]),
+          stamp2,
+          by,
+          c.id
+        );
+        for (const f of changed) logEvent(db2, c.id, f, cur[f] ?? null, next[f] ?? null, stamp2, by);
+        out.push(db2.get("SELECT * FROM project_events WHERE id = ?", c.id));
+      }
+      if (stale.length) throw new StaleEventError(stale);
+      return out;
+    });
+    return { ok: true, updated };
+  } catch (e) {
+    if (e instanceof StaleEventError) return { ok: false, reason: "stale", stale: e.rows };
+    return { ok: false, reason: "error", message: e.message };
+  }
+}
+function deleteEvent(db2, id, expectedUpdatedAt, now, by = "app") {
+  try {
+    tx(db2, () => {
+      const cur = db2.get("SELECT * FROM project_events WHERE id = ?", id);
+      if (!cur) throw new Error("Event not found.");
+      if (cur.updated_at !== expectedUpdatedAt) throw new Error("That event changed since you opened it. Reload and try again.");
+      db2.run("DELETE FROM project_events WHERE id = ?", id);
+      logEvent(db2, id, "deleted", JSON.stringify(cur), null, now > cur.updated_at ? now : bump(cur.updated_at), by);
+    });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, message: e.message };
+  }
+}
+function undoEvent(db2, rows, at, now) {
+  const id = rows[0].item_id;
+  const stamp2 = bump(at) > now ? bump(at) : now;
+  try {
+    tx(db2, () => {
+      const del = rows.find((r) => r.field === "event:deleted");
+      const created = rows.find((r) => r.field === "event:created");
+      if (del) {
+        const e = JSON.parse(del.old_value ?? "{}");
+        if (db2.get("SELECT 1 FROM project_events WHERE id = ?", e.id)) throw new Error("An event with that id exists again.");
+        db2.run(
+          `INSERT INTO project_events (id, project_id, track, kind, label, facility, start_date, end_date, confidence, note, updated_at, updated_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          e.id,
+          e.project_id,
+          e.track,
+          e.kind,
+          e.label,
+          e.facility,
+          e.start_date,
+          e.end_date,
+          e.confidence,
+          e.note,
+          e.updated_at,
+          e.updated_by
+        );
+        db2.run(
+          "INSERT INTO change_log (item_id, field, old_value, new_value, changed_at, changed_by) VALUES (?, ?, NULL, ?, ?, ?)",
+          id,
+          "undo:event:deleted",
+          "restored",
+          stamp2,
+          "app"
+        );
+      } else {
+        const cur = db2.get("SELECT * FROM project_events WHERE id = ?", id);
+        if (!cur || cur.updated_at !== at) throw new Error("That event changed after your edit, so undo was skipped. Reload to see the latest.");
+        if (created) {
+          db2.run("DELETE FROM project_events WHERE id = ?", id);
+          db2.run(
+            "INSERT INTO change_log (item_id, field, old_value, new_value, changed_at, changed_by) VALUES (?, ?, ?, NULL, ?, ?)",
+            id,
+            "undo:event:created",
+            created.new_value,
+            stamp2,
+            "app"
+          );
+        } else {
+          const cols = rows.map((r) => r.field.slice("event:".length));
+          db2.run(
+            `UPDATE project_events SET ${cols.map((f) => `${f} = ?`).join(", ")}, updated_at = ?, updated_by = 'app' WHERE id = ?`,
+            ...rows.map((r) => r.old_value),
+            stamp2,
+            id
+          );
+          for (const r of rows) {
+            db2.run(
+              "INSERT INTO change_log (item_id, field, old_value, new_value, changed_at, changed_by) VALUES (?, ?, ?, ?, ?, ?)",
+              id,
+              `undo:${r.field}`,
+              r.new_value,
+              r.old_value,
+              stamp2,
+              "app"
+            );
+          }
+        }
+      }
+      for (const r of rows) db2.run("UPDATE change_log SET field = 'undone:' || field WHERE id = ?", r.id);
+    });
+  } catch (e) {
+    return { ok: false, message: e.message, itemIds: [] };
+  }
+  return { ok: true, message: "Undid the event change.", itemIds: [] };
+}
 
 // src/core/tables.ts
 var EDITABLE = {
@@ -820,9 +1039,10 @@ var NOTES = {
   facilities: "Lab codes. Add a code here before using it on an item.",
   change_log: "Every change by the app or Luna. Read-only.",
   meta: "Import bookkeeping, writer notes, text styles. Read-only.",
-  views: "Saved chart views. Read-only here; manage them from the chart."
+  views: "Saved chart views. Read-only here; manage them from the chart.",
+  project_events: "Project detail (ranges and milestones). Read-only here; edit in the project view (double-click a project)."
 };
-var OURS = /* @__PURE__ */ new Set(["schedule_items", "projects", "facilities", "change_log", "meta", "views"]);
+var OURS = /* @__PURE__ */ new Set(["schedule_items", "projects", "facilities", "change_log", "meta", "views", "project_events"]);
 var EditError = class extends Error {
 };
 function tables(db2) {
@@ -924,6 +1144,13 @@ function insertRow(db2, table, values, now) {
   }
   throw new EditError(`${table} is read-only.`);
 }
+function countIf(db2, sql, v) {
+  try {
+    return db2.get(sql, v)?.n ?? 0;
+  } catch {
+    return 0;
+  }
+}
 function deleteRow(db2, table, keyValue, now) {
   tx(db2, () => {
     if (table === "schedule_items") {
@@ -941,13 +1168,13 @@ function deleteRow(db2, table, keyValue, now) {
       return;
     }
     if (table === "projects") {
-      const n = db2.get("SELECT count(*) n FROM schedule_items WHERE project_id = ?", Number(keyValue)).n;
-      if (n) throw new EditError(`This project still has ${n} item(s). Delete or move them first, or set active = 0 to hide it.`);
+      const n = db2.get("SELECT count(*) n FROM schedule_items WHERE project_id = ?", Number(keyValue)).n + countIf(db2, "SELECT count(*) n FROM project_events WHERE project_id = ?", Number(keyValue));
+      if (n) throw new EditError(`This project still has ${n} item(s) or event(s). Delete or move them first, or set active = 0 to hide it.`);
       if (db2.run("DELETE FROM projects WHERE id = ?", Number(keyValue)).changes !== 1) throw new EditError("Row not found.");
       return;
     }
     if (table === "facilities") {
-      const n = db2.get("SELECT count(*) n FROM schedule_items WHERE facility = ?", String(keyValue)).n;
+      const n = db2.get("SELECT count(*) n FROM schedule_items WHERE facility = ?", String(keyValue)).n + countIf(db2, "SELECT count(*) n FROM project_events WHERE facility = ?", String(keyValue));
       if (n) throw new EditError(`${n} item(s) use ${keyValue}. Set active = 0 instead.`);
       if (db2.run("DELETE FROM facilities WHERE code = ?", String(keyValue)).changes !== 1) throw new EditError("Row not found.");
       return;
@@ -1071,6 +1298,11 @@ ${e.message}` };
       return { ok: false, path: p, kind: "clash", message: d.reason };
     }
     if (d.kind === "empty") report = initEmpty(handle, nowIso());
+    if (d.kind === "untangle" && needsMigration(handle)) {
+      backup = backupDb(p, { tag: "pre-v2" });
+      backedUpThisSession = true;
+      migrate(handle);
+    }
     if (d.kind === "legacy") {
       backup = backupDb(p, { tag: "pre-import" });
       backedUpThisSession = true;
@@ -1084,7 +1316,7 @@ ${e.message}` };
   }
   db = handle;
   dbPath = p;
-  if (d.kind !== "legacy") backedUpThisSession = false;
+  if (!backup) backedUpThisSession = false;
   const dataset = readDataset();
   lastReport = report ?? storedReport();
   writeConfig({ ...readConfig(), dbPath: p });
@@ -1182,6 +1414,28 @@ import_electron.ipcMain.handle("db:addItem", (_e, projectId, type, start, end) =
   } catch (e) {
     return { ok: false, message: e.message };
   }
+});
+import_electron.ipcMain.handle("db:addEvent", (_e, input) => {
+  if (!db) return { ok: false, message: "No database open." };
+  ensureBackup();
+  try {
+    const event = addEvent(db, input, nowIso());
+    return { ok: true, event, dataset: readDataset() };
+  } catch (e) {
+    return { ok: false, message: e.message };
+  }
+});
+import_electron.ipcMain.handle("db:updateEvents", (_e, changes) => {
+  if (!db) return { ok: false, reason: "error", message: "No database open." };
+  ensureBackup();
+  const r = applyEventChanges(db, changes, nowIso());
+  return { ...r, dataset: readDataset() };
+});
+import_electron.ipcMain.handle("db:deleteEvent", (_e, id, expectedUpdatedAt) => {
+  if (!db) return { ok: false, message: "No database open." };
+  ensureBackup();
+  const r = deleteEvent(db, id, expectedUpdatedAt, nowIso());
+  return { ...r, dataset: readDataset() };
 });
 import_electron.ipcMain.handle("db:saveView", (_e, name, def) => {
   if (!db) throw new Error("No database open.");
@@ -1314,7 +1568,7 @@ import_electron.ipcMain.handle("export:pack", async (_e, req) => {
   if (!req.pages.length) return { ok: false, message: "Nothing to export: tick at least one page." };
   const path = await askExportPath(req.format, req.name);
   if (!path) return { ok: false, message: "cancelled" };
-  const base = { range: req.range, showOverlaps: req.showOverlaps, dataDate: lastDataDate() };
+  const base = { range: req.range, showOverlaps: req.showOverlaps, detail: !!req.detail, dataDate: lastDataDate() };
   try {
     if (req.format === "pdf") {
       await withExportWindow({ ...base, pages: req.pages }, async (ew) => (0, import_node_fs2.writeFileSync)(path, await printPdf(ew)));
