@@ -31,9 +31,9 @@ function quoteIdent(name) {
 }
 
 // src/core/schema.ts
-var SCHEMA_VERSION = 2;
+var SCHEMA_VERSION = 3;
 var V1_TABLES = ["facilities", "projects", "schedule_items", "change_log", "views", "meta"];
-var OUR_TABLES = [...V1_TABLES, "project_events"];
+var OUR_TABLES = [...V1_TABLES, "project_events", "project_test_links"];
 var SCHEMA_SQL = `CREATE TABLE IF NOT EXISTS facilities (
   code   TEXT PRIMARY KEY,
   name   TEXT,
@@ -111,13 +111,35 @@ var PROJECT_EVENTS_SQL = `CREATE TABLE IF NOT EXISTS project_events (
 CREATE INDEX IF NOT EXISTS idx_project_events_project ON project_events (project_id);
 CREATE INDEX IF NOT EXISTS idx_project_events_dates   ON project_events (start_date, end_date);
 `;
-var SCHEMA_FILE = `-- Untangle schema v2 (SPEC \xA74.2 + Software Book 11.6). Generated from src/core/schema.ts \u2014 do not edit by hand.
+var PROJECT_TEST_LINKS_SQL = `CREATE TABLE IF NOT EXISTS project_test_links (
+  id                INTEGER PRIMARY KEY,
+  project_id        INTEGER NOT NULL REFERENCES projects(id),
+  phase_item_id     INTEGER NOT NULL REFERENCES schedule_items(id),
+  phase             TEXT NOT NULL CHECK (phase IN ('development','dry_run','score')),
+  facility          TEXT REFERENCES facilities(code),
+  test_type         TEXT NOT NULL CHECK (test_type IN ('SIT','SLT','SDT')),
+  test_id           TEXT NOT NULL,
+  test_label        TEXT,
+  occurrence_count  INTEGER,
+  source_ref        TEXT,
+  confidence        TEXT NOT NULL DEFAULT 'notional' CHECK (confidence IN ('firm','estimated','notional')),
+  note              TEXT,
+  updated_at        TEXT NOT NULL,
+  updated_by        TEXT NOT NULL CHECK (updated_by IN ('app','luna')),
+  UNIQUE (phase_item_id, facility, test_type, test_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_test_links_phase_item ON project_test_links (phase_item_id);
+CREATE INDEX IF NOT EXISTS idx_project_test_links_project    ON project_test_links (project_id);
+`;
+var SCHEMA_FILE = `-- Untangle schema v3 (SPEC \xA74.2 + Software Book 11.6, 11.9). Generated from src/core/schema.ts \u2014 do not edit by hand.
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 PRAGMA user_version = ${SCHEMA_VERSION};
 
 ${SCHEMA_SQL}
-${PROJECT_EVENTS_SQL}`;
+${PROJECT_EVENTS_SQL}
+${PROJECT_TEST_LINKS_SQL}`;
 var STARTER_VIEWS = [
   { name: "Near term", definition: { range: { kind: "relative", monthsBefore: 0, monthsAfter: 18 }, lanes: "facility", filters: {} } },
   { name: "Long term", definition: { range: { kind: "fixed", start: "2026-01-01", end: "2035-12-31" }, lanes: "bucket", filters: {} } },
@@ -445,17 +467,20 @@ function detect(db2) {
 }
 function needsMigration(db2) {
   const version = db2.get("PRAGMA user_version")?.user_version ?? 0;
-  return version < SCHEMA_VERSION || !listTables(db2).includes("project_events");
+  const tables2 = listTables(db2);
+  return version < SCHEMA_VERSION || OUR_TABLES.some((t) => !tables2.includes(t));
 }
 function migrate(db2) {
   tx(db2, () => {
     db2.exec(PROJECT_EVENTS_SQL);
+    db2.exec(PROJECT_TEST_LINKS_SQL);
     db2.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   });
 }
 function createSchema(db2, now, extraFacilities = []) {
   db2.exec(SCHEMA_SQL);
   db2.exec(PROJECT_EVENTS_SQL);
+  db2.exec(PROJECT_TEST_LINKS_SQL);
   const fac = db2.get("SELECT count(*) n FROM facilities").n;
   if (fac === 0) for (const code of DEFAULT_FACILITIES) db2.run("INSERT INTO facilities (code, name) VALUES (?, ?)", code, code);
   for (const code of extraFacilities) db2.run("INSERT OR IGNORE INTO facilities (code, name) VALUES (?, ?)", code, code);
@@ -570,6 +595,17 @@ function openNodeSqlite(path, opts = {}) {
   };
 }
 
+// src/core/testLinks.ts
+var TEST_TYPES = ["SIT", "SLT", "SDT"];
+var PHASE_OF = {
+  system_dev: "development",
+  sw_dev: "development",
+  system_dry: "dry_run",
+  sw_dry: "dry_run",
+  system_score: "score",
+  sw_fqt: "score"
+};
+
 // src/core/labels.ts
 var EMPTY_STYLES = { all: {}, byType: {}, byItem: {} };
 function applyPatch(base, patch) {
@@ -587,6 +623,7 @@ function applyPatch(base, patch) {
 }
 
 // src/core/store.ts
+var ITEM_LOG_ONLY = "instr(field, 'event:') = 0 AND instr(field, 'test:') = 0";
 function loadDataset(db2) {
   const meta = {};
   for (const r of db2.all("SELECT key, value FROM meta")) meta[r.key] = r.value;
@@ -602,6 +639,7 @@ function loadDataset(db2) {
     items: db2.all("SELECT * FROM schedule_items ORDER BY project_id, start_date IS NULL, start_date, id"),
     // A v1 file (read by Luna's tools before the app migrates it) has no project_events yet.
     events: listTables(db2).includes("project_events") ? db2.all("SELECT * FROM project_events ORDER BY project_id, start_date IS NULL, start_date, id") : [],
+    testLinks: listTables(db2).includes("project_test_links") ? db2.all("SELECT * FROM project_test_links ORDER BY phase_item_id, id") : [],
     views: db2.all("SELECT id, name, definition FROM views ORDER BY id").map((v) => ({ id: v.id, name: v.name, definition: JSON.parse(v.definition) })),
     meta
   };
@@ -693,6 +731,7 @@ function undoLast(db2, now) {
     last.changed_at
   );
   if (rows.some((r) => r.field.startsWith("event:"))) return undoEvent(db2, rows.filter((r) => r.field.startsWith("event:")), last.changed_at, now);
+  if (rows.some((r) => r.field.startsWith("test:"))) return undoTestLink(db2, rows.filter((r) => r.field.startsWith("test:")), last.changed_at, now);
   const del = rows.find((r) => r.field === "deleted");
   if (del) {
     try {
@@ -732,7 +771,7 @@ function undoLast(db2, now) {
   for (const id of ids) {
     const cur = db2.get("SELECT updated_at FROM schedule_items WHERE id = ?", id);
     const mine = db2.get(
-      "SELECT changed_at FROM change_log WHERE item_id = ? AND changed_by = 'app' AND instr(field, 'event:') = 0 ORDER BY id DESC LIMIT 1",
+      `SELECT changed_at FROM change_log WHERE item_id = ? AND changed_by = 'app' AND ${ITEM_LOG_ONLY} ORDER BY id DESC LIMIT 1`,
       id
     );
     if (!cur || !mine || cur.updated_at !== mine.changed_at) {
@@ -951,6 +990,14 @@ function deleteEvent(db2, id, expectedUpdatedAt, now, by = "app") {
     return { ok: false, message: e.message };
   }
 }
+function onlyAppSince(db2, id, prefix, updatedBy) {
+  const newest = db2.get(
+    "SELECT changed_by FROM change_log WHERE item_id = ? AND instr(field, ?) > 0 ORDER BY id DESC LIMIT 1",
+    id,
+    prefix
+  );
+  return updatedBy === "app" && newest?.changed_by === "app";
+}
 function undoEvent(db2, rows, at, now) {
   const id = rows[0].item_id;
   const stamp2 = bump(at) > now ? bump(at) : now;
@@ -987,7 +1034,7 @@ function undoEvent(db2, rows, at, now) {
         );
       } else {
         const cur = db2.get("SELECT * FROM project_events WHERE id = ?", id);
-        if (!cur || cur.updated_at !== at) throw new Error("That event changed after your edit, so undo was skipped. Reload to see the latest.");
+        if (!cur || !onlyAppSince(db2, id, "event:", cur.updated_by)) throw new Error("That event changed after your edit, so undo was skipped. Reload to see the latest.");
         if (created) {
           db2.run("DELETE FROM project_events WHERE id = ?", id);
           db2.run(
@@ -1026,12 +1073,203 @@ function undoEvent(db2, rows, at, now) {
   }
   return { ok: true, message: "Undid the event change.", itemIds: [] };
 }
+var TEST_LINK_FIELDS = ["phase_item_id", "facility", "test_type", "test_id", "test_label", "occurrence_count", "source_ref", "confidence", "note"];
+var logTest = (db2, id, field, oldV, newV, at, by) => db2.run(
+  "INSERT INTO change_log (item_id, field, old_value, new_value, changed_at, changed_by) VALUES (?, ?, ?, ?, ?, ?)",
+  id,
+  `test:${field}`,
+  oldV,
+  newV,
+  at,
+  by
+);
+function settleTestLink(db2, row, selfId) {
+  const item = db2.get("SELECT * FROM schedule_items WHERE id = ?", row.phase_item_id);
+  if (!item) throw new Error(`Phase item ${row.phase_item_id} not found.`);
+  const phase = PHASE_OF[item.item_type];
+  if (!phase) throw new Error(`Tests link to a development, dry-run or score/FQT bar, not to ${item.item_type}.`);
+  if (!TEST_TYPES.includes(row.test_type)) throw new Error(`Test type must be ${TEST_TYPES.join(", ")}.`);
+  const testId = String(row.test_id ?? "").trim();
+  if (!testId) throw new Error("A test needs an id (e.g. 175).");
+  const facility = row.facility ? String(row.facility).toUpperCase() : null;
+  if (facility && !db2.get("SELECT 1 FROM facilities WHERE code = ?", facility)) throw new Error(`Unknown facility ${facility}. Add it in the facilities table first.`);
+  if (row.occurrence_count != null && !(Number.isInteger(Number(row.occurrence_count)) && Number(row.occurrence_count) >= 0)) {
+    throw new Error("Occurrences is a whole number (or empty).");
+  }
+  if (!CONFIDENCES.includes(row.confidence)) throw new Error("Confidence must be firm, estimated or notional.");
+  const dup = db2.get(
+    "SELECT id FROM project_test_links WHERE phase_item_id = ? AND IFNULL(facility, '') = ? AND test_type = ? AND test_id = ? AND id IS NOT ?",
+    row.phase_item_id,
+    facility ?? "",
+    row.test_type,
+    testId,
+    selfId
+  );
+  if (dup) throw new Error(`${row.test_type} ${testId}${facility ? ` at ${facility}` : ""} is already linked to this bar.`);
+  return {
+    ...row,
+    project_id: item.project_id,
+    phase,
+    facility,
+    test_id: testId,
+    occurrence_count: row.occurrence_count == null ? null : Number(row.occurrence_count)
+  };
+}
+var LINK_COLS = ["project_id", "phase_item_id", "phase", "facility", "test_type", "test_id", "test_label", "occurrence_count", "source_ref", "confidence", "note"];
+function addTestLink(db2, input, now, by = "app") {
+  return tx(db2, () => {
+    const row = settleTestLink(db2, {
+      project_id: 0,
+      phase: "development",
+      facility: null,
+      test_label: null,
+      occurrence_count: null,
+      source_ref: null,
+      confidence: "notional",
+      note: null,
+      ...input
+    }, null);
+    const r = db2.run(
+      `INSERT INTO project_test_links (${LINK_COLS.join(", ")}, updated_at, updated_by) VALUES (${LINK_COLS.map(() => "?").join(", ")}, ?, ?)`,
+      ...LINK_COLS.map((c) => row[c]),
+      now,
+      by
+    );
+    logTest(db2, r.lastInsertRowid, "created", null, `${row.test_type} ${row.test_id}`, now, by);
+    return db2.get("SELECT * FROM project_test_links WHERE id = ?", r.lastInsertRowid);
+  });
+}
+var StaleTestLinkError = class extends Error {
+  constructor(rows) {
+    super("stale");
+    this.rows = rows;
+  }
+  rows;
+};
+function applyTestLinkChanges(db2, changes, now, by = "app") {
+  try {
+    const updated = tx(db2, () => {
+      const stale = [];
+      const out = [];
+      for (const c of changes) {
+        const cur = db2.get("SELECT * FROM project_test_links WHERE id = ?", c.id);
+        if (!cur) throw new Error(`Test link ${c.id} no longer exists.`);
+        if (cur.updated_at !== c.expectedUpdatedAt) {
+          stale.push(cur);
+          continue;
+        }
+        const merged = { ...cur };
+        for (const f of Object.keys(c.patch).filter((f2) => TEST_LINK_FIELDS.includes(f2))) {
+          merged[f] = c.patch[f] ?? null;
+        }
+        const next = { ...cur, ...settleTestLink(db2, merged, cur.id) };
+        const changed = LINK_COLS.filter((f) => next[f] !== cur[f]);
+        if (changed.length === 0) {
+          out.push(cur);
+          continue;
+        }
+        const stamp2 = now > cur.updated_at ? now : bump(cur.updated_at);
+        db2.run(
+          `UPDATE project_test_links SET ${changed.map((f) => `${f} = ?`).join(", ")}, updated_at = ?, updated_by = ? WHERE id = ?`,
+          ...changed.map((f) => next[f]),
+          stamp2,
+          by,
+          c.id
+        );
+        for (const f of changed) {
+          logTest(db2, c.id, f, cur[f] == null ? null : String(cur[f]), next[f] == null ? null : String(next[f]), stamp2, by);
+        }
+        out.push(db2.get("SELECT * FROM project_test_links WHERE id = ?", c.id));
+      }
+      if (stale.length) throw new StaleTestLinkError(stale);
+      return out;
+    });
+    return { ok: true, updated };
+  } catch (e) {
+    if (e instanceof StaleTestLinkError) return { ok: false, reason: "stale", stale: e.rows };
+    return { ok: false, reason: "error", message: e.message };
+  }
+}
+function deleteTestLink(db2, id, expectedUpdatedAt, now, by = "app") {
+  tx(db2, () => {
+    const cur = db2.get("SELECT * FROM project_test_links WHERE id = ?", id);
+    if (!cur) throw new Error("Test link not found.");
+    if (expectedUpdatedAt !== null && cur.updated_at !== expectedUpdatedAt) throw new Error("That test link changed since you loaded it. Reload and try again.");
+    db2.run("DELETE FROM project_test_links WHERE id = ?", id);
+    logTest(db2, id, "deleted", JSON.stringify(cur), null, now > cur.updated_at ? now : bump(cur.updated_at), by);
+  });
+}
+function undoTestLink(db2, rows, at, now) {
+  const id = rows[0].item_id;
+  const stamp2 = bump(at) > now ? bump(at) : now;
+  try {
+    tx(db2, () => {
+      const del = rows.find((r) => r.field === "test:deleted");
+      const created = rows.find((r) => r.field === "test:created");
+      if (del) {
+        const l = JSON.parse(del.old_value ?? "{}");
+        if (db2.get("SELECT 1 FROM project_test_links WHERE id = ?", l.id)) throw new Error("A test link with that id exists again.");
+        const cols = ["id", ...LINK_COLS, "updated_at", "updated_by"];
+        db2.run(
+          `INSERT INTO project_test_links (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`,
+          ...cols.map((c) => l[c])
+        );
+        db2.run(
+          "INSERT INTO change_log (item_id, field, old_value, new_value, changed_at, changed_by) VALUES (?, ?, NULL, ?, ?, ?)",
+          id,
+          "undo:test:deleted",
+          "restored",
+          stamp2,
+          "app"
+        );
+      } else {
+        const cur = db2.get("SELECT * FROM project_test_links WHERE id = ?", id);
+        if (!cur || !onlyAppSince(db2, id, "test:", cur.updated_by)) throw new Error("That test link changed after your edit, so undo was skipped. Reload to see the latest.");
+        if (created) {
+          db2.run("DELETE FROM project_test_links WHERE id = ?", id);
+          db2.run(
+            "INSERT INTO change_log (item_id, field, old_value, new_value, changed_at, changed_by) VALUES (?, ?, ?, NULL, ?, ?)",
+            id,
+            "undo:test:created",
+            created.new_value,
+            stamp2,
+            "app"
+          );
+        } else {
+          const cols = rows.map((r) => r.field.slice("test:".length));
+          db2.run(
+            `UPDATE project_test_links SET ${cols.map((f) => `${f} = ?`).join(", ")}, updated_at = ?, updated_by = 'app' WHERE id = ?`,
+            ...rows.map((r) => r.old_value),
+            stamp2,
+            id
+          );
+          for (const r of rows) {
+            db2.run(
+              "INSERT INTO change_log (item_id, field, old_value, new_value, changed_at, changed_by) VALUES (?, ?, ?, ?, ?, ?)",
+              id,
+              `undo:${r.field}`,
+              r.new_value,
+              r.old_value,
+              stamp2,
+              "app"
+            );
+          }
+        }
+      }
+      for (const r of rows) db2.run("UPDATE change_log SET field = 'undone:' || field WHERE id = ?", r.id);
+    });
+  } catch (e) {
+    return { ok: false, message: e.message, itemIds: [] };
+  }
+  return { ok: true, message: "Undid the test-link change.", itemIds: [] };
+}
 
 // src/core/tables.ts
 var EDITABLE = {
   schedule_items: { key: "id", cols: ["item_type", "label", "facility", "start_date", "end_date", "confidence"] },
   projects: { key: "id", cols: ["name", "bucket", "baseline", "technical_lead", "sort_order", "active"] },
-  facilities: { key: "code", cols: ["name", "active"] }
+  facilities: { key: "code", cols: ["name", "active"] },
+  project_test_links: { key: "id", cols: ["phase_item_id", "facility", "test_type", "test_id", "test_label", "occurrence_count", "source_ref", "confidence", "note"] }
 };
 var NOTES = {
   schedule_items: "One row per bar or milestone. Edits are logged and can be undone (Ctrl+Z).",
@@ -1040,9 +1278,10 @@ var NOTES = {
   change_log: "Every change by the app or Luna. Read-only.",
   meta: "Import bookkeeping, writer notes, text styles. Read-only.",
   views: "Saved chart views. Read-only here; manage them from the chart.",
-  project_events: "Project detail (ranges and milestones). Read-only here; edit in the project view (double-click a project)."
+  project_events: "Project detail (ranges and milestones). Read-only here; edit in the project view (double-click a project).",
+  project_test_links: "PTP tests (SIT/SLT/SDT) per dev / dry-run / score bar and facility. No dates: a test uses its bar\u2019s dates. Edits are logged and can be undone."
 };
-var OURS = /* @__PURE__ */ new Set(["schedule_items", "projects", "facilities", "change_log", "meta", "views", "project_events"]);
+var OURS = /* @__PURE__ */ new Set(["schedule_items", "projects", "facilities", "change_log", "meta", "views", "project_events", "project_test_links"]);
 var EditError = class extends Error {
 };
 function tables(db2) {
@@ -1060,7 +1299,7 @@ function columnsOf(db2, table, facilities) {
     name: c.name,
     type: c.type || "ANY",
     editable: !!ed?.cols.includes(c.name),
-    options: table === "schedule_items" && c.name === "item_type" ? [...ITEM_TYPES] : table === "schedule_items" && c.name === "confidence" ? [...CONFIDENCES] : table === "schedule_items" && c.name === "facility" ? ["", ...facilities] : table === "projects" && c.name === "bucket" ? ["", ...BUCKETS] : c.name === "active" && ed ? ["1", "0"] : void 0
+    options: table === "schedule_items" && c.name === "item_type" ? [...ITEM_TYPES] : table === "schedule_items" && c.name === "confidence" ? [...CONFIDENCES] : table === "schedule_items" && c.name === "facility" ? ["", ...facilities] : table === "project_test_links" && c.name === "facility" ? ["", ...facilities] : table === "project_test_links" && c.name === "test_type" ? [...TEST_TYPES] : table === "project_test_links" && c.name === "confidence" ? [...CONFIDENCES] : table === "projects" && c.name === "bucket" ? ["", ...BUCKETS] : c.name === "active" && ed ? ["1", "0"] : void 0
   }));
 }
 function readPage(db2, table, opts = {}) {
@@ -1110,6 +1349,14 @@ function updateCell(db2, table, keyValue, column, value, now, expectedVersion, b
     if (!r2.ok) throw new EditError(r2.reason === "stale" ? "This row changed since you loaded it (Luna or another edit). Reloaded \u2014 try again." : r2.message);
     return;
   }
+  if (table === "project_test_links") {
+    const cur = db2.get("SELECT id, updated_at FROM project_test_links WHERE id = ?", Number(keyValue));
+    if (!cur) throw new EditError(`No test link ${keyValue}.`);
+    const val2 = column === "phase_item_id" || column === "occurrence_count" ? v === null ? null : Number(v) : v;
+    const r2 = applyTestLinkChanges(db2, [{ id: cur.id, expectedUpdatedAt: expectedVersion ?? cur.updated_at, patch: { [column]: val2 } }], now, by);
+    if (!r2.ok) throw new EditError(r2.reason === "stale" ? "This row changed since you loaded it (Luna or another edit). Reloaded \u2014 try again." : r2.message);
+    return;
+  }
   if (table === "projects") {
     if (column === "name" && !v) throw new EditError("Name is required.");
     if (column === "name" && db2.get("SELECT 1 FROM projects WHERE lower(name) = lower(?) AND id <> ?", String(v), Number(keyValue))) throw new EditError(`Another project is already called ${v}.`);
@@ -1127,6 +1374,19 @@ function insertRow(db2, table, values, now) {
     const type = values.item_type || "other";
     if (!ITEM_TYPES.includes(type)) throw new EditError("Bad type.");
     return addItem(db2, pid, type, blank(values.start_date) ?? null, blank(values.end_date) ?? null, now).id;
+  }
+  if (table === "project_test_links") {
+    try {
+      return addTestLink(db2, {
+        phase_item_id: Number(values.phase_item_id),
+        test_type: String(values.test_type ?? "SIT"),
+        test_id: String(values.test_id ?? ""),
+        facility: blank(values.facility) ?? null,
+        test_label: blank(values.test_label) ?? null
+      }, now).id;
+    } catch (e) {
+      throw new EditError(e.message);
+    }
   }
   if (table === "projects") {
     const name = String(values.name ?? "").trim();
@@ -1152,10 +1412,20 @@ function countIf(db2, sql, v) {
   }
 }
 function deleteRow(db2, table, keyValue, now) {
+  if (table === "project_test_links") {
+    try {
+      deleteTestLink(db2, Number(keyValue), null, now);
+    } catch (e) {
+      throw new EditError(e.message);
+    }
+    return;
+  }
   tx(db2, () => {
     if (table === "schedule_items") {
       const cur = db2.get("SELECT * FROM schedule_items WHERE id = ?", Number(keyValue));
       if (!cur) throw new EditError("Row not found.");
+      const links = countIf(db2, "SELECT count(*) n FROM project_test_links WHERE phase_item_id = ?", cur.id);
+      if (links) throw new EditError(`This bar has ${links} linked test(s). Delete or move them in project_test_links first.`);
       db2.run("DELETE FROM schedule_items WHERE id = ?", cur.id);
       db2.run(
         "INSERT INTO change_log (item_id, field, old_value, new_value, changed_at, changed_by) VALUES (?, ?, ?, NULL, ?, ?)",
@@ -1299,7 +1569,7 @@ ${e.message}` };
     }
     if (d.kind === "empty") report = initEmpty(handle, nowIso());
     if (d.kind === "untangle" && needsMigration(handle)) {
-      backup = backupDb(p, { tag: "pre-v2" });
+      backup = backupDb(p, { tag: `pre-v${SCHEMA_VERSION}` });
       backedUpThisSession = true;
       migrate(handle);
     }
@@ -1436,6 +1706,31 @@ import_electron.ipcMain.handle("db:deleteEvent", (_e, id, expectedUpdatedAt) => 
   ensureBackup();
   const r = deleteEvent(db, id, expectedUpdatedAt, nowIso());
   return { ...r, dataset: readDataset() };
+});
+import_electron.ipcMain.handle("db:addTestLink", (_e, input) => {
+  if (!db) return { ok: false, message: "No database open." };
+  ensureBackup();
+  try {
+    addTestLink(db, input, nowIso());
+    return { ok: true, dataset: readDataset() };
+  } catch (e) {
+    return { ok: false, message: e.message };
+  }
+});
+import_electron.ipcMain.handle("db:updateTestLinks", (_e, changes) => {
+  if (!db) return { ok: false, reason: "error", message: "No database open." };
+  ensureBackup();
+  return { ...applyTestLinkChanges(db, changes, nowIso()), dataset: readDataset() };
+});
+import_electron.ipcMain.handle("db:deleteTestLink", (_e, id, expectedUpdatedAt) => {
+  if (!db) return { ok: false, message: "No database open." };
+  ensureBackup();
+  try {
+    deleteTestLink(db, id, expectedUpdatedAt, nowIso());
+    return { ok: true, dataset: readDataset() };
+  } catch (e) {
+    return { ok: false, message: e.message, dataset: readDataset() };
+  }
 });
 import_electron.ipcMain.handle("db:saveView", (_e, name, def) => {
   if (!db) throw new Error("No database open.");
