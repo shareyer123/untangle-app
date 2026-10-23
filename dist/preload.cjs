@@ -16,6 +16,7 @@ var api = {
   addTestLink: (input) => import_electron.ipcRenderer.invoke("db:addTestLink", input),
   updateTestLinks: (changes) => import_electron.ipcRenderer.invoke("db:updateTestLinks", changes),
   deleteTestLink: (id, expectedUpdatedAt) => import_electron.ipcRenderer.invoke("db:deleteTestLink", id, expectedUpdatedAt),
+  setPriority: (projectId, priority) => import_electron.ipcRenderer.invoke("db:setPriority", projectId, priority),
   saveView: (name, def) => import_electron.ipcRenderer.invoke("db:saveView", name, def),
   deleteView: (id) => import_electron.ipcRenderer.invoke("db:deleteView", id),
   setLabels: (scope, patch, mode) => import_electron.ipcRenderer.invoke("db:setLabels", scope, patch, mode),

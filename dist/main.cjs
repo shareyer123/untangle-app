@@ -30,10 +30,39 @@ function quoteIdent(name) {
   return `"${name.replace(/"/g, '""')}"`;
 }
 
+// src/core/types.ts
+var ITEM_TYPES = [
+  "system_dev",
+  "system_dry",
+  "system_score",
+  "sw_dev",
+  "sw_dry",
+  "sw_fqt",
+  "trr",
+  "other"
+];
+var BUCKETS = ["CDM", "FDR", "OBS", "LAB", "RFC"];
+var CONFIDENCES = ["firm", "estimated", "notional"];
+var DEFAULT_FACILITIES = ["STF", "AIA", "ITF", "CCF"];
+
 // src/core/schema.ts
 var SCHEMA_VERSION = 3;
 var V1_TABLES = ["facilities", "projects", "schedule_items", "change_log", "views", "meta"];
 var OUR_TABLES = [...V1_TABLES, "project_events", "project_test_links"];
+function allowedBuckets(db2) {
+  const sql = db2.get("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'projects'")?.sql ?? "";
+  const m = sql.match(/bucket[^,]*?CHECK\s*\(\s*bucket\s+IN\s*\(([^)]*)\)/i);
+  if (!m) return [...BUCKETS];
+  const inCheck = m[1].split(",").map((x) => x.trim().replace(/^'|'$/g, "").toUpperCase());
+  return BUCKETS.filter((b) => inCheck.includes(b));
+}
+function bucketMessage(db2, v) {
+  const ok = allowedBuckets(db2);
+  if (BUCKETS.includes(v.toUpperCase())) {
+    return `This database does not accept bucket ${v.toUpperCase()} yet: its projects table only allows ${ok.join(", ")}. Update the projects table first (see the Software Book).`;
+  }
+  return `Bucket must be ${ok.join(", ")} or empty.`;
+}
 var SCHEMA_SQL = `CREATE TABLE IF NOT EXISTS facilities (
   code   TEXT PRIMARY KEY,
   name   TEXT,
@@ -43,11 +72,12 @@ var SCHEMA_SQL = `CREATE TABLE IF NOT EXISTS facilities (
 CREATE TABLE IF NOT EXISTS projects (
   id             INTEGER PRIMARY KEY,
   name           TEXT NOT NULL UNIQUE,
-  bucket         TEXT CHECK (bucket IN ('CDM','FDR','OBS')),
+  bucket         TEXT CHECK (bucket IN ('CDM','FDR','OBS','LAB','RFC')),
   baseline       TEXT,
   technical_lead TEXT,
   sort_order     INTEGER,
-  active         INTEGER NOT NULL DEFAULT 1
+  active         INTEGER NOT NULL DEFAULT 1,
+  priority       INTEGER CHECK (priority IS NULL OR priority >= 1)
 );
 
 CREATE TABLE IF NOT EXISTS schedule_items (
@@ -152,23 +182,9 @@ var WRITER_NOTES = `How to write to this database (for Luna):
 - trr is a single date: set start_date, leave end_date NULL. Every other type is a range, end inclusive.
 - On every change set updated_at to the current ISO timestamp and updated_by = 'luna'.
 - Append one change_log row per changed field (changed_by = 'luna').
-- facility must be a code in facilities (add the code there first). bucket is CDM, FDR, OBS or NULL.
-- confidence is firm, estimated or notional.`;
-
-// src/core/types.ts
-var ITEM_TYPES = [
-  "system_dev",
-  "system_dry",
-  "system_score",
-  "sw_dev",
-  "sw_dry",
-  "sw_fqt",
-  "trr",
-  "other"
-];
-var BUCKETS = ["CDM", "FDR", "OBS"];
-var CONFIDENCES = ["firm", "estimated", "notional"];
-var DEFAULT_FACILITIES = ["STF", "AIA", "ITF", "CCF"];
+- facility must be a code in facilities (add the code there first). bucket is CDM, FDR, OBS, LAB (Lab Upgrade), RFC or NULL.
+- confidence is firm, estimated or notional.
+- projects.priority: 1 = highest, NULL = none (orders projects across buckets). Log a change as field project:priority.`;
 
 // src/core/import/columns.ts
 var tokensOf = (name) => name.replace(/([a-z])([A-Z])/g, "$1_$2").toLowerCase().replace(/[^a-z0-9]+/g, "_").split("_").filter(Boolean);
@@ -315,8 +331,9 @@ function bucketFromName(name) {
 function normBucket(v) {
   if (isTbd(v)) return null;
   const s = String(v).trim().toUpperCase();
-  if (s === "CDM" || s === "FDR" || s === "OBS") return s;
+  if (s === "CDM" || s === "FDR" || s === "OBS" || s === "LAB" || s === "RFC") return s;
   if (s.startsWith("OBSOLESCENCE")) return "OBS";
+  if (s.startsWith("LAB UPGRADE")) return "LAB";
   return null;
 }
 var text = (v) => isTbd(v) ? null : String(v).trim();
@@ -623,7 +640,58 @@ function applyPatch(base, patch) {
 }
 
 // src/core/store.ts
-var ITEM_LOG_ONLY = "instr(field, 'event:') = 0 AND instr(field, 'test:') = 0";
+var ITEM_LOG_ONLY = "instr(field, 'event:') = 0 AND instr(field, 'test:') = 0 AND instr(field, 'project:') = 0";
+var hasPriority = (db2) => tableColumns(db2, "projects").includes("priority");
+function setProjectPriority(db2, projectId, priority, now, by = "app") {
+  if (!hasPriority(db2)) return { ok: false, message: "This database has no priority column yet. Update the projects table first (see the Software Book)." };
+  if (priority !== null && (!Number.isInteger(priority) || priority < 1)) return { ok: false, message: "Priority is a whole number from 1 (highest), or empty." };
+  try {
+    tx(db2, () => {
+      const cur = db2.get("SELECT priority FROM projects WHERE id = ?", projectId);
+      if (!cur) throw new Error(`No project ${projectId}.`);
+      if (cur.priority === priority) return;
+      const last = db2.get("SELECT max(changed_at) m FROM change_log")?.m;
+      const stamp2 = last && last >= now ? bump(last) : now;
+      db2.run("UPDATE projects SET priority = ? WHERE id = ?", priority, projectId);
+      db2.run(
+        "INSERT INTO change_log (item_id, field, old_value, new_value, changed_at, changed_by) VALUES (?, ?, ?, ?, ?, ?)",
+        projectId,
+        "project:priority",
+        cur.priority === null ? null : String(cur.priority),
+        priority === null ? null : String(priority),
+        stamp2,
+        by
+      );
+    });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, message: e.message };
+  }
+}
+function undoProject(db2, rows, now) {
+  try {
+    tx(db2, () => {
+      for (const r of rows) {
+        const cur = db2.get("SELECT priority FROM projects WHERE id = ?", r.item_id);
+        if (!cur || String(cur.priority ?? "") !== (r.new_value ?? "")) throw new Error("That project\u2019s priority changed after your edit, so undo was skipped.");
+        db2.run("UPDATE projects SET priority = ? WHERE id = ?", r.old_value === null ? null : Number(r.old_value), r.item_id);
+        db2.run("UPDATE change_log SET field = 'undone:project:priority' WHERE id = ?", r.id);
+        db2.run(
+          "INSERT INTO change_log (item_id, field, old_value, new_value, changed_at, changed_by) VALUES (?, ?, ?, ?, ?, ?)",
+          r.item_id,
+          "undo:project:priority",
+          r.new_value,
+          r.old_value,
+          now,
+          "app"
+        );
+      }
+    });
+    return { ok: true, message: "Priority change undone.", itemIds: [] };
+  } catch (e) {
+    return { ok: false, message: e.message, itemIds: [] };
+  }
+}
 function loadDataset(db2) {
   const meta = {};
   for (const r of db2.all("SELECT key, value FROM meta")) meta[r.key] = r.value;
@@ -635,7 +703,8 @@ function loadDataset(db2) {
   return {
     labelStyles,
     facilities: db2.all("SELECT code, name, active FROM facilities ORDER BY code"),
-    projects: db2.all("SELECT * FROM projects WHERE active = 1 ORDER BY sort_order IS NULL, sort_order, name"),
+    // priority exists once Codex has rebuilt the projects table; before that every project has none.
+    projects: db2.all("SELECT * FROM projects WHERE active = 1 ORDER BY sort_order IS NULL, sort_order, name").map((p) => ({ ...p, priority: p.priority ?? null })),
     items: db2.all("SELECT * FROM schedule_items ORDER BY project_id, start_date IS NULL, start_date, id"),
     // A v1 file (read by Luna's tools before the app migrates it) has no project_events yet.
     events: listTables(db2).includes("project_events") ? db2.all("SELECT * FROM project_events ORDER BY project_id, start_date IS NULL, start_date, id") : [],
@@ -732,6 +801,7 @@ function undoLast(db2, now) {
   );
   if (rows.some((r) => r.field.startsWith("event:"))) return undoEvent(db2, rows.filter((r) => r.field.startsWith("event:")), last.changed_at, now);
   if (rows.some((r) => r.field.startsWith("test:"))) return undoTestLink(db2, rows.filter((r) => r.field.startsWith("test:")), last.changed_at, now);
+  if (rows.some((r) => r.field.startsWith("project:"))) return undoProject(db2, rows.filter((r) => r.field.startsWith("project:")), now);
   const del = rows.find((r) => r.field === "deleted");
   if (del) {
     try {
@@ -1267,13 +1337,13 @@ function undoTestLink(db2, rows, at, now) {
 // src/core/tables.ts
 var EDITABLE = {
   schedule_items: { key: "id", cols: ["item_type", "label", "facility", "start_date", "end_date", "confidence"] },
-  projects: { key: "id", cols: ["name", "bucket", "baseline", "technical_lead", "sort_order", "active"] },
+  projects: { key: "id", cols: ["name", "bucket", "baseline", "technical_lead", "sort_order", "active", "priority"] },
   facilities: { key: "code", cols: ["name", "active"] },
   project_test_links: { key: "id", cols: ["phase_item_id", "facility", "test_type", "test_id", "test_label", "occurrence_count", "source_ref", "confidence", "note"] }
 };
 var NOTES = {
   schedule_items: "One row per bar or milestone. Edits are logged and can be undone (Ctrl+Z).",
-  projects: "Projects. Name must be unique; bucket CDM, FDR, OBS or empty (TBD).",
+  projects: "Projects. Name must be unique; bucket CDM, FDR, OBS, LAB (Lab Upgrade), RFC or empty (TBD).",
   facilities: "Lab codes. Add a code here before using it on an item.",
   change_log: "Every change by the app or Luna. Read-only.",
   meta: "Import bookkeeping, writer notes, text styles. Read-only.",
@@ -1299,7 +1369,7 @@ function columnsOf(db2, table, facilities) {
     name: c.name,
     type: c.type || "ANY",
     editable: !!ed?.cols.includes(c.name),
-    options: table === "schedule_items" && c.name === "item_type" ? [...ITEM_TYPES] : table === "schedule_items" && c.name === "confidence" ? [...CONFIDENCES] : table === "schedule_items" && c.name === "facility" ? ["", ...facilities] : table === "project_test_links" && c.name === "facility" ? ["", ...facilities] : table === "project_test_links" && c.name === "test_type" ? [...TEST_TYPES] : table === "project_test_links" && c.name === "confidence" ? [...CONFIDENCES] : table === "projects" && c.name === "bucket" ? ["", ...BUCKETS] : c.name === "active" && ed ? ["1", "0"] : void 0
+    options: table === "schedule_items" && c.name === "item_type" ? [...ITEM_TYPES] : table === "schedule_items" && c.name === "confidence" ? [...CONFIDENCES] : table === "schedule_items" && c.name === "facility" ? ["", ...facilities] : table === "project_test_links" && c.name === "facility" ? ["", ...facilities] : table === "project_test_links" && c.name === "test_type" ? [...TEST_TYPES] : table === "project_test_links" && c.name === "confidence" ? [...CONFIDENCES] : table === "projects" && c.name === "bucket" ? ["", ...allowedBuckets(db2)] : c.name === "active" && ed ? ["1", "0"] : void 0
   }));
 }
 function readPage(db2, table, opts = {}) {
@@ -1360,7 +1430,12 @@ function updateCell(db2, table, keyValue, column, value, now, expectedVersion, b
   if (table === "projects") {
     if (column === "name" && !v) throw new EditError("Name is required.");
     if (column === "name" && db2.get("SELECT 1 FROM projects WHERE lower(name) = lower(?) AND id <> ?", String(v), Number(keyValue))) throw new EditError(`Another project is already called ${v}.`);
-    if (column === "bucket" && v !== null && !BUCKETS.includes(String(v).toUpperCase())) throw new EditError("Bucket must be CDM, FDR, OBS or empty.");
+    if (column === "bucket" && v !== null && !allowedBuckets(db2).includes(String(v).toUpperCase())) throw new EditError(bucketMessage(db2, String(v)));
+    if (column === "priority") {
+      const r2 = setProjectPriority(db2, Number(keyValue), v === null ? null : Number(v), now, by);
+      if (!r2.ok) throw new EditError(r2.message ?? "Priority not saved.");
+      return;
+    }
   }
   if (column === "active" && v !== null && !["0", "1", 0, 1].includes(v)) throw new EditError("Active is 1 or 0.");
   const val = column === "bucket" && v !== null ? String(v).toUpperCase() : column === "active" || column === "sort_order" ? v === null ? null : Number(v) : v;
@@ -1705,6 +1780,12 @@ import_electron.ipcMain.handle("db:deleteEvent", (_e, id, expectedUpdatedAt) => 
   if (!db) return { ok: false, message: "No database open." };
   ensureBackup();
   const r = deleteEvent(db, id, expectedUpdatedAt, nowIso());
+  return { ...r, dataset: readDataset() };
+});
+import_electron.ipcMain.handle("db:setPriority", (_e, projectId, priority) => {
+  if (!db) return { ok: false, message: "No database open." };
+  ensureBackup();
+  const r = setProjectPriority(db, projectId, priority, nowIso());
   return { ...r, dataset: readDataset() };
 });
 import_electron.ipcMain.handle("db:addTestLink", (_e, input) => {
